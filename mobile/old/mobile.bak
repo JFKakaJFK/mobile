@@ -1,0 +1,238 @@
+#include <ArduinoBLE.h> // actually https://github.com/dominsch/ArduinoBLE
+#include <Adafruit_NeoPixel.h>
+
+// --- CONFIG ---
+#define OBJECTS 7 // Number of objects
+
+// LEDs
+#define LED_PIN 6      // LED Input PIN
+#define LEDS_PER_OBJ 3 // LEDs per object
+"rgb(0,0,0)"
+// BLE
+#define MOBILE_SERVICE "19b10000-e8f2-537e-4f6c-d104768a1214"
+
+#define MOBILE_READ_STATE "0001"
+#define MOBILE_SET_STATE "0002"
+
+#define MOBILE_READ_COLORS "0003"
+#define MOBILE_CHANGE_COLORS "0004"
+
+// --- BLE setup ---
+
+// STATE MACHINE
+// STATE            |  INPUT    | OUTPUT STATE
+// ( on, colors)    |       off | (off, all black)
+// ( on, colors)    |        on | ( on, colors)
+// ( on, colors)    | newColors | ( on, colors + newColors)
+// (off, all black) |       off | (off, all black)
+// (off, all black) |        on | ( on, colors)
+// (off, colors)    | newColors | ( on, colors + newColors)
+
+// mobile service offers following characteristics
+BLEService mobile(MOBILE_SERVICE);
+// turn of/on
+BLEByteCharacteristic state(MOBILE_READ_STATE, BLERead | BLENotify | BLEIndicate);
+BLEByteCharacteristic setState(MOBILE_SET_STATE, BLEWrite);
+// colors
+uint32_t colorBackup[OBJECTS] = {};
+BLECharacteristic colors(
+    MOBILE_READ_COLORS,
+    BLERead | BLENotify | BLEIndicate,
+    sizeof(uint32_t) * OBJECTS,
+    true);
+BLEUnsignedIntCharacteristic setColors(MOBILE_CHANGE_COLORS, BLEWrite);
+
+/**
+ * Writes the current colors into the backup
+ */
+void createColorBackup()
+{
+  for (int i = 0; i < OBJECTS; i++)
+  {
+    colorBackup[i] = (uint32_t)colors.value()[i * sizeof(uint32_t)];
+  }
+}
+
+/**
+ * Restores the colors from the backup
+ */
+void restoreColorBackup()
+{
+  colors.writeValue((byte *)colorBackup, sizeof(uint32_t) * OBJECTS);
+}
+
+/**
+ * Starts the BLE service
+ */
+void setupBLE()
+{
+  // BLE init
+  while (!BLE.begin())
+    ; // start BLE
+
+  // device name
+  BLE.setDeviceName("Mobile");
+  BLE.setLocalName("Mobile");
+
+  // mobile service
+  BLE.setAdvertisedServiceUuid(MOBILE_SERVICE);
+  BLE.setAdvertisedService(mobile);
+  // service characteristics
+  mobile.addCharacteristic(state);
+  mobile.addCharacteristic(setState);
+  mobile.addCharacteristic(colors);
+  mobile.addCharacteristic(setColors);
+  // add service
+  BLE.addService(mobile);
+  // start advertising
+  BLE.advertise();
+}
+
+/**
+ * Handles state change events
+ */
+void handleStateChange()
+{
+  Serial.println("setState");
+  Serial.println(setState.value());
+  if (setState.value() > 0 && !state.value())
+  {
+    // restore colors
+    restoreColorBackup();
+    // turn on
+    state.writeValue(setState.value());
+  }
+  else if (setState.value() == 0 && state.value())
+  {
+    // store colors
+    createColorBackup();
+    // turn off
+    state.writeValue(setState.value());
+  }
+  // update
+  updateMobile();
+}
+
+void handleColorsChange()
+{
+  Serial.print("setColors ");
+  Serial.print((setColors.value() >> 24) & 0xFF);
+  Serial.print(" | ");
+  Serial.print((setColors.value() >> 16) & 0xFF);
+  Serial.print(" | ");
+  Serial.print((setColors.value() >>  8) & 0xFF);
+  Serial.print(" | ");
+  Serial.println((setColors.value() >>  0) & 0xFF);
+
+
+  
+  uint8_t objs = setColors.value() & 0xFF;
+  Serial.println(objs);
+  uint32_t color = setColors.value() >> 8;
+  // changing color turns on again?
+  if (!state.value() && color > 0){
+    state.writeValue(1); // turn on
+    // restore other colors too?
+    restoreColorBackup();
+  }
+  Serial.println(color);
+  uint32_t newColors[OBJECTS] = {};
+
+  // set the color for each of the objects
+  for (int i = 0; i < OBJECTS; i++)
+  {
+    if (objs & (1 << i))
+    { // is the bit for the object set in the bitmap
+      Serial.print("setting LED ");
+      Serial.println(i);
+      newColors[i] = color;
+    }
+  }
+  colors.writeValue((byte *)newColors, sizeof(uint32_t) * OBJECTS);
+
+  // update
+  updateMobile();
+}
+
+// --- LED setup ---
+
+// TODO
+// Adafruit_NeoPixel strip(
+//     OBJECTS *LEDS_PER_OBJ, // Number of LEDs
+//     LED_PIN,
+//     NEO_GRB + NEO_KHZ800 // 800KHz GRB Bitstream
+// );
+
+void setupLEDs()
+{
+  // strip.begin();            // initializes LEDs
+  // strip.show();             // turn LEDs off
+  // strip.setBrightness(255); // set maximum brightness
+}
+
+// TODO
+// sets the color of a mobile object
+void setColor(uint16_t obj, uint32_t color)
+{
+  // Serial.printf("rgb(%d,%d,%d)\n", color & 0xFF0000, color & 0x00FF00, color & 0x0000FF);
+  String rgb = "["; rgb+= obj;rgb+="]rgb("; rgb += (color >> 16) & 0xFF; rgb += ",";rgb += (color >> 8) & 0xFF; rgb += ",";rgb += color & 0xFF; rgb += ")";
+  Serial.println(rgb);
+  // int first = obj * LEDS_PER_OBJ;
+  // for (int i = first; i < first + LEDS_PER_OBJ; i++)
+  // {
+  //   strip.setPixelColor(i, color);
+  // }
+}
+
+void updateMobile()
+{
+  if (state.value())
+  { // turned on
+    for (int i = 0; i < OBJECTS; i++)
+    {
+      setColor(i, (uint32_t)colors.value()[i * sizeof(uint32_t)]);
+    }
+  }
+  else
+  { // turned off
+    // TODO strip.off?
+    for (int i = 0; i < OBJECTS; i++)
+    {
+      setColor(i, 0);
+    }
+  }
+  // TODO
+  // strip.show();
+}
+
+// Arduino default, executed once on startup
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial)
+    ;
+  Serial.println("setup");
+  // LED init
+  setupLEDs();
+
+  setupBLE();
+}
+
+// Arduino default, executed repeatedly after setup()
+void loop()
+{
+  // listen for BLE connections
+  BLEDevice central = BLE.central();
+
+  if (central)
+  {
+    // handle remote commands until disconnected
+    while (central.connected())
+    {
+      if (setColors.written())
+        handleColorsChange();
+      if (setState.written())
+        handleStateChange();
+    }
+  }
+}

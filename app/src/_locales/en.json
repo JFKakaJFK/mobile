@@ -1,0 +1,25 @@
+{
+  "translation": {
+    "objects": {
+      "Sun": "Sun",
+      "Planet": "Planet",
+      "Satellite": "Satellite",
+      "Saturn": "Saturn",
+      "Moon": "Moon",
+      "Meteorite": "Meteorite",
+      "Rocket": "Rocket"
+    },
+    "state": {
+      "On": "On",
+      "Off": "Off"
+    },
+    "error": {
+      "No Bluetooth radio available.": "Bluetooth not available.",
+      "User cancelled the requestDevice() chooser.": "No device selected."
+    },
+    "text": {
+      "connected": "connected",
+      "not connected": "not connected"
+    }
+  }
+}

@@ -1,0 +1,337 @@
+#include <ArduinoBLE.h> // actually https://github.com/dominsch/ArduinoBLE
+#include <FastLED.h>
+
+#define OBJECTS 7 // Number of objects
+
+void setup() {
+  //Serial.begin(115200);
+  Serial.begin(9600);
+  while (!Serial);
+  Serial.println("Starting ...");
+  setupLEDs();
+  setupBLE();
+}
+
+
+void rgb(CRGB c) {
+  Serial.print("rgb(");
+  Serial.print(c.r);
+  Serial.print(",");
+  Serial.print(c.g);
+  Serial.print(",");
+  Serial.print(c.b);
+  Serial.print(")");
+}
+
+bool idle = false; // is there a need for fast animations?
+
+#define BUSY_WAIT 0 // ms
+#define IDLE_WAIT 3600000 // ms
+
+void loop() {
+  Serial.print("--- LOOP ---\nidle: "); Serial.println(idle);
+  // poll for BLE events
+  BLE.poll(idle ? IDLE_WAIT : BUSY_WAIT);
+  // update
+  updateMobile();
+}
+
+// --- BLE setup ---
+
+// BLE
+#define MOBILE_SERVICE "19b10000-e8f2-537e-4f6c-d104768a1214"
+
+#define MOBILE_READ_STATE "0001"
+#define MOBILE_SET_STATE "0002"
+
+#define MOBILE_READ_COLORS "0003"
+#define MOBILE_CHANGE_COLORS "0004"
+
+// mobile service offers following characteristics
+BLEService mobile(MOBILE_SERVICE);
+
+#define COLOR_SIZE 3 // 1byte for each RGB channel
+#define PAYLOAD_SIZE 5 // 1byte header + 4byte params
+
+BLEBoolCharacteristic state(MOBILE_READ_STATE, BLERead | BLENotify | BLEIndicate);
+BLEBoolCharacteristic setState(MOBILE_SET_STATE, BLEWrite);
+BLECharacteristic colors(MOBILE_READ_COLORS, BLERead | BLENotify | BLEIndicate, COLOR_SIZE * OBJECTS);
+BLECharacteristic setColors(MOBILE_CHANGE_COLORS, BLEWrite, PAYLOAD_SIZE);
+
+/**
+   Starts the BLE service
+*/
+void setupBLE() {
+  // BLE init
+  while (!BLE.begin())
+    ; // start BLE
+
+  // device name
+  BLE.setDeviceName("Mobile");
+  BLE.setLocalName("Mobile");
+
+  // mobile service
+  BLE.setAdvertisedServiceUuid(MOBILE_SERVICE);
+  BLE.setAdvertisedService(mobile);
+
+  // allow state to we read
+  mobile.addCharacteristic(state);
+  state.setValue(false);
+  // allow changing the state
+  mobile.addCharacteristic(setState);
+  setState.setEventHandler(BLEWritten, onSetState);
+
+  // allow reading the object colors
+  mobile.addCharacteristic(colors);
+  byte tmp[OBJECTS] = {};
+  colors.setValue(tmp, COLOR_SIZE * OBJECTS);
+  // allow changing the colors
+  mobile.addCharacteristic(setColors);
+  setColors.setEventHandler(BLEWritten, onSetColors);
+
+  // add service
+  BLE.addService(mobile);
+
+  // handle connects/disconnects
+  BLE.setEventHandler(BLEConnected, onConnect);
+  BLE.setEventHandler(BLEDisconnected, onDisconnect);
+
+  // start advertising
+  BLE.advertise();
+}
+
+/**
+   Handles state change events
+*/
+void onSetState(BLEDevice central, BLECharacteristic characteristic) {
+  Serial.print("setState "); Serial.println(setState.value());
+
+  // update state
+  if (setState.value() != state.value())
+    state.writeValue(setState.value() > 0);
+}
+
+#define DATA_PIN 25 //6
+#define LEDS_PER_OBJECT 3
+
+CRGB leds[LEDS_PER_OBJECT * OBJECTS];
+
+void setupLEDs() {
+  FastLED.addLeds<NEOPIXEL, DATA_PIN>(leds, LEDS_PER_OBJECT * OBJECTS);
+  for(byte i=0; i<LEDS_PER_OBJECT * OBJECTS; i++){
+    leds[i] = 0x000000;
+  }
+  FastLED.show();
+}
+
+void setObjColor(byte object, CRGB color) {
+  int first = object * LEDS_PER_OBJECT;
+  for (int i = first; i < first + LEDS_PER_OBJECT; i++) {
+    leds[i] = color;
+  }
+}
+
+/*
+
+  A setColors payload has 5 bytes:
+  1byte  MODE_ID
+  4bytes PARAMETERS
+
+
+  | MODE         | MODE_ID | PARAMETERS                                                |
+  |--------------|---------|-----------------------------------------------------------|
+  | SINGLE_COLOR | 0x00    | objects   | r                             | g     | b     |
+  | COLOR_ROTATE | 0x01    | direction | rotations_to_direction_change | duration      |
+  | RAINBOW      | 0x02    | direction | rotations_to_direction_change | duration      |
+
+*/
+
+#define SINGLE_COLOR_MODE  0x00 // no animation
+#define SINGLE_COLOR_FADE_DURATION 300 //ms                        
+#define RAINBOW_MODE       0x01 // rotating rainbow (rotating hsv wheel)
+#define COLOR_ROTATE_MODE  0x02 // rotate current colors
+
+// current mode
+byte mode = SINGLE_COLOR_MODE;
+
+// parameters needed for each of the modes
+unsigned long lastColorChangeTime;
+CRGB prevColors[OBJECTS];
+CRGB targetColors[OBJECTS];
+
+uint8_t angle = 0; // 0-255
+uint8_t direction = 0; // 0 or 1
+uint8_t initDirection = 0;
+uint8_t rotationsToDirectionChange = 0; // 0-255, where 0 is never change
+unsigned long duration = 0; // rotation duration in sec/10
+
+void onSetColors(BLEDevice central, BLECharacteristic characteristic) {
+  Serial.print("setColor ");
+  for (byte i = 0; i < setColors.valueLength(); i++) {
+    Serial.print(setColors.value()[i] & 0xFFFF);
+    Serial.print(",");
+  }
+  Serial.println("");
+
+  const byte *payload = setColors.value();
+
+  // changing the color/mode turns on the mobile automatically (but does not restore the stored colors!)
+  if (!state.value()) {
+    state.writeValue(true);
+  }
+
+  mode = payload[0]; // get mode
+
+  switch (mode) {
+    case SINGLE_COLOR_MODE: { // TODO factor out in initSingleColorMode(byte* payload, CRGB* leds) + updateSingleColorMode(CRGB* leds)
+        // take note when the color was set
+        lastColorChangeTime = millis();
+        // adjust target colors
+        CRGB c = CRGB(payload[2], payload[3], payload[4]);
+        for (byte i = 0; i < OBJECTS; i++) {
+          if (payload[1] & (1 << i)) {
+            prevColors[i] = leds[i * LEDS_PER_OBJECT];
+            targetColors[i] = c;
+          }
+        }
+      } break;
+    case RAINBOW_MODE: {
+        lastColorChangeTime = millis();
+        angle = millis() % 255;
+        initDirection = payload[1];
+        direction = payload[1];
+        rotationsToDirectionChange = payload[2];
+        duration = 1 | ((payload[3] << 8) + payload[4]) * 100; // .1 seconds
+      }
+      break;
+    case COLOR_ROTATE_MODE: {
+      }
+      break;
+  }
+}
+
+void onConnect(BLEDevice central) {
+  // central connected event handler
+  Serial.print("Connected event, central: ");
+  Serial.println(central.address());
+}
+
+void onDisconnect(BLEDevice central) {
+  // central disconnected event handler
+  Serial.print("Disconnected event, central: ");
+  Serial.println(central.address());
+}
+
+#define interpolate(f,t,p) ((f) * (1 - (p)) + (t) * (p))
+
+CRGB fade(CRGB from, CRGB to, float progress) {
+  rgb(from); Serial.print(" -> "); rgb(to); Serial.print(" @"); Serial.print(progress); Serial.println("%");
+
+  if (progress > .999) {
+    return to;
+  }
+
+  CHSV fhsv = rgb2hsv_approximate(from);
+  CHSV thsv = rgb2hsv_approximate(  to);
+  CHSV step;
+  step.h = interpolate(fhsv.h, thsv.h, progress);
+  step.s = interpolate(fhsv.s, thsv.s, progress);
+  step.v = interpolate(fhsv.v, thsv.v, progress);
+  CRGB res; hsv2rgb_rainbow(step, res);
+  return res;
+}
+
+// getColor?
+// leds accesses seem weird
+
+#define MAX_UPDATE_FREQUENCY 20 // ms
+bool dirty = false;
+unsigned long lastUpdate = 0;
+byte currentColors[3 * OBJECTS] = {};
+void updateMobile() {
+  // save actual colors (loop over objects + save color)
+  CRGB prev[OBJECTS];
+  for (byte i = 0; i < OBJECTS; i++) {
+    prev[i] = leds[i * LEDS_PER_OBJECT];
+  }
+
+  // update colors according to mode
+  if (state.value() > 0) {
+    switch (mode) {
+      case SINGLE_COLOR_MODE: {// last color change, fade duration
+          // loop over all objs
+          for (byte i = 0; i < OBJECTS; i++) {
+            int obj = i * LEDS_PER_OBJECT;
+            if (targetColors[i] != leds[obj]) {
+              // if color is not target color, fade towards target color (store time of last change)
+              int diff = millis() - lastColorChangeTime;
+              if (diff < SINGLE_COLOR_FADE_DURATION) {
+                float progress = ((float) diff) / ((float) SINGLE_COLOR_FADE_DURATION);
+                setObjColor(i, fade(prevColors[i], targetColors[i], progress));
+              } else {
+                setObjColor(i, targetColors[i]);
+              }
+            }
+          }
+        } break;
+      case RAINBOW_MODE: { // rotation_duration, angle (0-255), #iteration, change_direction_after_n_iterations
+          unsigned long delta = millis() - lastColorChangeTime;
+          angle += (direction || -1) * 255 * ((float)(delta % duration) / (float)duration);
+          Serial.print("angle: ");Serial.println(angle);
+          if (rotationsToDirectionChange > 0) {
+            int rts = delta / duration / rotationsToDirectionChange;
+            direction = rts % 2 == 0 ? initDirection :  1 - initDirection;
+          }
+
+          float slice = 255.0f / (float) OBJECTS;
+          for (byte i = 0; i < OBJECTS; i++) {
+            CHSV step = CHSV(angle + slice * i, 255, 255);
+            CRGB res; hsv2rgb_rainbow(step, res);
+            setObjColor(i, res);
+          }
+
+        } break;
+      case COLOR_ROTATE_MODE: {
+        } break;
+    }
+  } else {
+    // turn all leds off
+    for (byte i; i < LEDS_PER_OBJECT * OBJECTS; i++) {
+      leds[i] = 0x000000;
+    }
+  }
+
+  // if new actual colors differ from saved actual colors update
+  idle = true;
+  for (byte i = 0; i < OBJECTS; i++) {
+    int obj = i * LEDS_PER_OBJECT;
+    if (prev[i] != leds[obj]) {
+      idle = false;
+      break;
+    }
+  }
+
+  if (!idle) {
+    FastLED.show(); // actually show the new colors
+    dirty = true;   // make sure that the ble clients are updated at some point
+  }
+
+  // update ble clients if necessary
+  if (dirty && millis() - lastUpdate >= MAX_UPDATE_FREQUENCY){
+    byte current[COLOR_SIZE * OBJECTS];
+    for (byte i = 0; i < OBJECTS; i++) {
+      int obj = i * LEDS_PER_OBJECT;
+      current[i]   = leds[obj].r;
+      current[i + 1] = leds[obj].g;
+      current[i + 2] = leds[obj].b;
+      
+      Serial.print(i);
+      Serial.print(": ");
+      rgb(leds[obj]);
+      Serial.println("");
+    }
+    colors.writeValue(current , COLOR_SIZE * OBJECTS);
+    dirty = false;
+    lastUpdate = millis();
+  }
+}
